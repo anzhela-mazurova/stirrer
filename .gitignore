@@ -1,6 +1,14 @@
 #Freecad
 *.gcode
 *.fcstd1
+*.stl
+
+#Eagle
+*.s#*
+*.b#*
+
+#joe
+*~
 
 
 # Object files
