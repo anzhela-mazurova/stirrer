@@ -2,6 +2,11 @@
 *.gcode
 *.fcstd1
 
+# Eagle
+
+*.s#?
+*.b#?
+*.l#?
 
 # Object files
 *.o
