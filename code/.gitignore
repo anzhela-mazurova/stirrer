@@ -1,0 +1,4 @@
+#Ignore Build Environment files and folders as well as temporary or backup files
+*~
+model/.stirrer
+

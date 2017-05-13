@@ -1,0 +1,1611 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<model version="4.0.1" links="0">
+ <documentation>Magnetic stirrer control board source model</documentation>
+ <framework name="qpc"/>
+ <package name="Events" stereotype="0x01">
+  <class name="TachoEvt" superclass="qpc::QEvt">
+   <attribute name="val" type="uint16_t" visibility="0x00" properties="0x00">
+    <documentation>Averaged RPM value from IC (tacho) peripheral </documentation>
+   </attribute>
+  </class>
+ </package>
+ <package name="AOs" stereotype="0x02">
+  <class name="Front" superclass="qpc::QActive">
+   <documentation>User Interface. Receives encoder commands, manages LCD display, serial console. Sends out motor commands to control.</documentation>
+   <attribute name="RdyTimeEvt" type="QTimeEvt" visibility="0x02" properties="0x00">
+    <documentation>READY timer</documentation>
+   </attribute>
+   <attribute name="HoldTimeEvt" type="QTimeEvt" visibility="0x02" properties="0x00">
+    <documentation>timer to determine long press on encoder shaft</documentation>
+   </attribute>
+   <attribute name="navgen" type="NavGen" visibility="0x02" properties="0x00"/>
+   <operation name="blankBuf" type="void" visibility="0x02" properties="0x01">
+    <documentation>fills display buffer with whitespace characters</documentation>
+    <code>int8_t i;    //index
+
+for ( i = 0; i &lt; Q_DIM( display_buffer ); i++ ) {
+
+    display_buffer[ i ] = 0x20;
+}</code>
+   </operation>
+   <operation name="printStr" type="void" visibility="0x02" properties="0x01">
+    <documentation>Places a string pointer into the console queue. Triggers ISR to re-read the queue
+if the queue was empty</documentation>
+    <parameter name="str" type="const char*"/>
+    <code>/* ----------------------------- 80 symbols --------------------------------- */
+#ifdef Q_SPY    //suppress UART output and print string as an app.record
+
+    QS_BEGIN( CONSOLE_OUT, AO_Front )
+        QS_STR( str );
+    QS_END()
+    return;
+
+#else    // Q_SPY
+
+uint8_t tmphead = ConsoleTx_Head + 1;
+
+#if CONSOLE_TX_BUFMASK &lt; 255
+    tmphead &amp;= CONSOLE_TX_BUFMASK;
+#endif
+
+    while ( tmphead == ConsoleTx_Tail ) {}     //this line blocks! return from the brackets
+
+    ConsoleTx_Buf[ tmphead ] = /*(const uint8_t*)*/str;
+
+    ConsoleTx_Head = tmphead;
+
+    if ( _U2TXIE == 0) {    //trigger interrupt
+        _U2TXIF = 1;
+        _U2TXIE = 1;
+    }
+#endif    // Q_SPY</code>
+   </operation>
+   <operation name="printNum" type="void" visibility="0x02" properties="0x01">
+    <documentation>Creates a number from const strings and places it into the console queue
+Note1: this function can potentially place large number of elements into the queue.
+Size your queue accordingly
+Note 2: positive numbers only
+Note 3: max.base 16</documentation>
+    <parameter name="num" type="uint32_t"/>
+    <parameter name="base" type="uint8_t"/>
+    <code>#define CHAR_BUFSIZE 33
+ const char* const numchars[] = {&quot;0&quot;,&quot;1&quot;,&quot;2&quot;,&quot;3&quot;,&quot;4&quot;,&quot;5&quot;,&quot;6&quot;,&quot;7&quot;,&quot;8&quot;,&quot;9&quot;,&quot;A&quot;,&quot;B&quot;,&quot;C&quot;,&quot;D&quot;,&quot;E&quot;,&quot;F&quot;};
+ const char* buf[CHAR_BUFSIZE];
+ const char** pStr = &amp;(buf[CHAR_BUFSIZE-1]);
+
+    do {
+
+        *(--pStr) = numchars[num % base];
+
+        num /= base;
+    } while( num != 0 );
+
+    while( pStr &lt; &amp;buf[CHAR_BUFSIZE-1] ) {    //copy the buffer into the queue
+
+        Front_printStr( *pStr++ );
+    }</code>
+   </operation>
+   <operation name="printRoll" type="void" visibility="0x02" properties="0x01">
+    <documentation>If called repeatedly, outputs BSD-style rotating symbol
+Note: the first symbol the function sends is a backspace which erases the
+previous symbol. If the previous symbol was a newline, some terminals will
+erase it before executing</documentation>
+    <code>#define IDX_MASK 3
+ const char* const rollchar[4] = {&quot;/&quot;,&quot;-&quot;,&quot;\\&quot;,&quot;|&quot;};
+ static uint8_t idx = 0;
+
+    Front_printStr(&quot;\x08&quot;);    //backspace
+
+    Front_printStr( rollchar[idx++] );
+
+    idx &amp;= IDX_MASK;</code>
+   </operation>
+   <operation name="NavGen_ctor" type="void" visibility="0x02" properties="0x01">
+    <documentation>initial transition of Nav.generator SM</documentation>
+    <parameter name="me" type="NavGen* const"/>
+    <code>QHsm_ctor(&amp;me-&gt;super, Q_STATE_CAST(&amp;NavGen_initial));</code>
+   </operation>
+   <operation name="a4960Xfer" type="uint16_t" visibility="0x02" properties="0x01">
+    <documentation>performs single 16-bit transfer between a4960 BLDC motor controller via SPI.
+SPI2-specific.</documentation>
+    <parameter name="reg" type="uint8_t"/>
+    <parameter name="data" type="uint16_t"/>
+    <code>ALCS_PIN = 0;    //assert CS
+
+SPI2BUF = (( reg &lt;&lt; 12 ) | ( data &amp; 0x0fff ));
+
+while(SPI2STATbits.SPIRBF == 0);    //wait till end of xfer
+
+ALCS_PIN = 1;    //assert CS
+
+return( SPI2BUF );</code>
+   </operation>
+   <statechart>
+    <initial target="../1">
+     <action>ConsoleTx_Head = 0;
+ConsoleTx_Tail = 0;</action>
+     <initial_glyph conn="4,4,4,3,10,2">
+      <action box="0,-2,10,2"/>
+     </initial_glyph>
+    </initial>
+    <state name="Startup">
+     <entry>QTimeEvt_armX(&amp;me-&gt;RdyTimeEvt, READY_TIME, 0U);</entry>
+     <exit>Front_printStr(&quot;Stirrer Serial Console\r\n&quot;);
+Front_printStr(&quot;Compiled on &quot;);
+Front_printStr(__DATE__);
+Front_printStr(&quot; &quot;);
+Front_printStr(__TIME__);
+Front_printStr(&quot; using Microchip xc16 ver.&quot;);
+Front_printNum(__XC16_VERSION__, 10);
+Front_printStr(&quot;\r\nQuantum Leaps QP ver.&quot;);
+Front_printStr(QP_VERSION_STR);
+Front_printStr(&quot;\r\n&quot;);</exit>
+     <tran trig="READY" target="../../2/5/4">
+      <tran_glyph conn="6,14,3,0,14,14">
+       <action box="0,-2,10,2"/>
+      </tran_glyph>
+     </tran>
+     <state_glyph node="6,6,16,13">
+      <entry box="1,2,6,2"/>
+      <exit box="1,4,6,2"/>
+     </state_glyph>
+    </state>
+    <state name="Operational">
+     <tran trig="ENCI, ENCD, HOLD_TIMEOUT">
+      <action>QHSM_DISPATCH(Q_HSM_UPCAST(&amp;me-&gt;navgen),((QEvt*)(e)));</action>
+      <tran_glyph conn="4,88,3,-1,20">
+       <action box="0,-2,21,2"/>
+      </tran_glyph>
+     </tran>
+     <tran trig="PRESS">
+      <action>QTimeEvt_armX(&amp;me-&gt;HoldTimeEvt, HOLD_TIME, 0U);
+QHSM_DISPATCH(Q_HSM_UPCAST(&amp;me-&gt;navgen),((QEvt*)(e)));</action>
+      <tran_glyph conn="4,91,3,-1,6">
+       <action box="0,-2,7,2"/>
+      </tran_glyph>
+     </tran>
+     <tran trig="RELEASE">
+      <action>QTimeEvt_disarm(&amp;me-&gt;HoldTimeEvt);
+QHSM_DISPATCH(Q_HSM_UPCAST(&amp;me-&gt;navgen),((QEvt*)(e)));</action>
+      <tran_glyph conn="4,94,3,-1,8">
+       <action box="0,-2,9,2"/>
+      </tran_glyph>
+     </tran>
+     <state name="Navigate">
+      <tran trig="CLICK" target="../../4">
+       <tran_glyph conn="28,77,1,3,6">
+        <action box="0,-2,10,2"/>
+       </tran_glyph>
+      </tran>
+      <tran trig="RIGHT" target="..">
+       <tran_glyph conn="28,67,1,1,2,2,-2">
+        <action box="-6,-2,6,2"/>
+       </tran_glyph>
+      </tran>
+      <tran trig="LEFT" target="..">
+       <tran_glyph conn="28,72,1,1,2,2,-2">
+        <action box="-6,-2,5,2"/>
+       </tran_glyph>
+      </tran>
+      <tran trig="HOLD, NAV_TIMEOUT" target="../../5" cpref="../../5/0">
+       <tran_glyph conn="20,62,0,2,-7">
+        <action box="0,-5,11,4"/>
+       </tran_glyph>
+      </tran>
+      <state_glyph node="6,62,22,21"/>
+     </state>
+     <state name="Edit">
+      <tran trig="CLICK" target="../../3">
+       <tran_glyph conn="34,79,3,1,-6">
+        <action box="0,-2,7,2"/>
+       </tran_glyph>
+      </tran>
+      <tran trig="RIGHT" target="..">
+       <tran_glyph conn="56,67,1,1,2,2,-2">
+        <action box="-7,-2,6,2"/>
+       </tran_glyph>
+      </tran>
+      <tran trig="LEFT" target="..">
+       <tran_glyph conn="56,71,1,1,2,2,-2">
+        <action box="-7,-2,5,2"/>
+       </tran_glyph>
+      </tran>
+      <tran trig="HOLD, NAV_TIMEOUT" target="../../3">
+       <tran_glyph conn="34,81,3,1,-6">
+        <action box="0,-2,16,2"/>
+       </tran_glyph>
+      </tran>
+      <state_glyph node="34,62,22,21"/>
+     </state>
+     <state name="Dashboard">
+      <documentation>or navigate to edit screens for each parameter by rotating the knob left or right or switch to sysyem settings menu by holding the knob in presssed state for a TBD period of time</documentation>
+      <history type="deep" target="../4">
+       <history_glyph conn="20,54,2,2,-6"/>
+      </history>
+      <tran trig="LEFT">
+       <action>/* go to end of parameters sequence */</action>
+       <tran_glyph conn="14,54,2,-1,3">
+        <action box="0,-2,6,2"/>
+       </tran_glyph>
+      </tran>
+      <tran trig="RIGHT">
+       <action>/* go to beginning of parameters sequence */</action>
+       <tran_glyph conn="12,54,2,-1,3">
+        <action box="0,-4,6,2"/>
+       </tran_glyph>
+      </tran>
+      <tran trig="HOLD">
+       <action>/* go to beginning of settings sequence */</action>
+       <tran_glyph conn="10,54,2,-1,3">
+        <action box="0,-6,5,2"/>
+       </tran_glyph>
+      </tran>
+      <state name="Idle">
+       <documentation>Power-on screen. Displays current RPM (duty cycle for open-loop motor controllers), ramp, duration parameter values. From this screen, operator can either start the motor using current parameter values by clicking on the knob </documentation>
+       <entry>const uint8_t const idle[] = {&quot;IDLE&quot;};
+const uint8_t const rpm[] = {&quot; RPM&quot;};
+uint8_t buf[6] = {0};
+
+Front_blankBuf();
+memcpy( display_buffer, idle, ( Q_DIM(idle) - 1 ));
+itoa( SetRpm, buf );
+memcpy( display_buffer + 12U - strlen((const char*)(buf)),
+    buf, strlen((const char*)(buf))); 
+
+memcpy( display_buffer + 12U, rpm, ( Q_DIM(rpm) - 1 ));
+
+T2CONbits.TON = 1;        /* start timer */
+_T2IF = 1;                /* set interrupt flag */
+_T2IE = 1;                /* enable interrupt */
+Front_printStr(&quot;Idle\r\n&quot;);</entry>
+       <tran trig="CLICK" target="../../5">
+        <action>/* start the motor using current rev and ramp */
+uint32_t tmpdata = Front_a4960Xfer(A4960_RUN_RD,0U);         //read RUN register
+    QS_BEGIN( CONSOLE_OUT, AO_Front )
+        QS_U32_HEX( 8, tmpdata );
+    QS_END()
+tmpdata = 0x01;    // set RUN bit
+
+Front_a4960Xfer(A4960_RUN_WR, 1U );</action>
+        <tran_glyph conn="8,34,3,3,32">
+         <action box="0,-2,10,2"/>
+        </tran_glyph>
+       </tran>
+       <tran trig="RIGHT" target="..">
+        <action>SetRpm++;</action>
+        <tran_glyph conn="24,39,1,1,2,2,-2">
+         <action box="0,-2,10,2"/>
+        </tran_glyph>
+       </tran>
+       <tran trig="LEFT" target="..">
+        <action>SetRpm--;</action>
+        <tran_glyph conn="24,44,1,1,2,2,-2">
+         <action box="0,-2,7,2"/>
+        </tran_glyph>
+       </tran>
+       <state_glyph node="8,28,16,20">
+        <entry box="1,2,6,2"/>
+       </state_glyph>
+      </state>
+      <state name="Run">
+       <documentation>This screen is displayed when motor is running. Outputs RPM (DC) and countdown till stop or a whirling star. Click stops the motor and navigates to idle screen</documentation>
+       <entry>const uint8_t const run[] = {&quot;RUN&quot;};
+
+Front_printStr(&quot;Run\r\n&quot;);
+
+Front_blankBuf();
+memcpy( display_buffer, run, ( Q_DIM(run) - 1 ));
+
+T2CONbits.TON = 1;        /* start timer */
+_T2IF = 1;                /* set interrupt flag */
+_T2IE = 1;                /* enable interrupt */
+
+ewma_init( &amp;avg_rpm, RPM_WEIGHT );</entry>
+       <tran trig="CLICK" target="../../4">
+        <action>uint32_t tmpdata = Front_a4960Xfer(A4960_RUN_RD,0U);         //read RUN register
+    QS_BEGIN( CONSOLE_OUT, AO_Front )
+        QS_U32_HEX( 8, tmpdata );
+    QS_END()
+tmpdata = 0;    // clear RUN bit
+
+Front_a4960Xfer(A4960_RUN_WR, 0U );</action>
+        <tran_glyph conn="56,36,1,1,-32">
+         <action box="-6,-2,6,2"/>
+        </tran_glyph>
+       </tran>
+       <tran trig="RIGHT" target="..">
+        <action>OC1R++;</action>
+        <tran_glyph conn="56,38,1,1,2,2,-2">
+         <action box="0,-2,10,2"/>
+        </tran_glyph>
+       </tran>
+       <tran trig="LEFT" target="..">
+        <action>// SetRpm--;
+
+OC1R--;</action>
+        <tran_glyph conn="56,44,1,1,2,2,-2">
+         <action box="0,-2,7,2"/>
+        </tran_glyph>
+       </tran>
+       <tran trig="TACHO">
+        <action>const uint8_t const run[] = {&quot;RUN&quot;};
+const uint8_t const rpm[] = {&quot; RPM&quot;};
+uint8_t buf[6] = {0};
+
+Front_blankBuf();
+
+memcpy( display_buffer, run, ( Q_DIM(run) - 1 ));
+
+itoa( Q_EVT_CAST(TachoEvt)-&gt;val, buf );
+
+memcpy( display_buffer + 12U - strlen((const char*)(buf)),
+    buf, strlen((const char*)(buf))); 
+
+memcpy( display_buffer + 12U, rpm, ( Q_DIM(rpm) - 1 ));
+
+T2CONbits.TON = 1;        /* start timer */
+_T2IF = 1;                /* set interrupt flag */
+_T2IE = 1;                /* enable interrupt */
+
+Front_printStr(&quot;Run\r\n&quot;);</action>
+        <tran_glyph conn="40,42,3,-1,8">
+         <action box="0,-2,6,2"/>
+        </tran_glyph>
+       </tran>
+       <state_glyph node="40,28,16,20">
+        <entry box="1,2,6,2"/>
+       </state_glyph>
+      </state>
+      <state_glyph node="6,24,56,30"/>
+     </state>
+     <state_glyph node="4,21,63,75"/>
+    </state>
+    <state_diagram size="121,99"/>
+   </statechart>
+  </class>
+  <class name="NavGen" superclass="qpc::QHsm">
+   <documentation>State machine that takes raw encoder signals and outputs signals to navigate the screen. </documentation>
+   <attribute name="encval" type="int8_t" visibility="0x02" properties="0x00">
+    <documentation>accumulated value of the encoder</documentation>
+   </attribute>
+   <statechart>
+    <initial target="../1/2">
+     <action>me-&gt;encval = 0;</action>
+     <initial_glyph conn="7,2,4,0,7">
+      <action box="0,-2,10,2"/>
+     </initial_glyph>
+    </initial>
+    <state name="HandleEncoder">
+     <tran trig="ENCI">
+      <action>static QEvt const RightEvt = { RIGHT_SIG, 0U, 0U };
+
+if ( ++me-&gt;encval &gt;  EncoderSensIdx ) {
+
+    QACTIVE_POST_X(AO_Front, &amp;RightEvt, 1, me);
+    me-&gt;encval = 0;
+}</action>
+      <tran_glyph conn="2,24,3,-1,6">
+       <action box="0,-2,6,2"/>
+      </tran_glyph>
+     </tran>
+     <tran trig="ENCD">
+      <action>static QEvt const LeftEvt = { LEFT_SIG, 0U, 0U };
+
+if (( --me-&gt;encval + EncoderSensIdx ) &lt; 0 ) {
+    
+    me-&gt;encval = 0;
+    QACTIVE_POST_X(AO_Front, &amp;LeftEvt, 1, me);
+}</action>
+      <tran_glyph conn="2,28,3,-1,6">
+       <action box="0,-2,7,2"/>
+      </tran_glyph>
+     </tran>
+     <state name="Released">
+      <tran trig="PRESS" target="../../3">
+       <tran_glyph conn="4,15,3,3,11">
+        <action box="0,-2,7,2"/>
+       </tran_glyph>
+      </tran>
+      <state_glyph node="4,9,8,9"/>
+     </state>
+     <state name="Pressed">
+      <tran trig="HOLD_TIMEOUT" target="../../2">
+       <action>static QEvt const HoldEvt = { HOLD_SIG, 0U, 0U };
+QACTIVE_POST_X(AO_Front, &amp;HoldEvt, 1, me);</action>
+       <tran_glyph conn="28,13,1,1,-16">
+        <action box="-12,-2,12,2"/>
+       </tran_glyph>
+      </tran>
+      <tran trig="RELEASE" target="../../2">
+       <action>static QEvt const ClickEvt = { CLICK_SIG, 0U, 0U };
+QACTIVE_POST_X(AO_Front, &amp;ClickEvt, 1, me);</action>
+       <tran_glyph conn="28,16,1,1,-16">
+        <action box="-8,-2,8,2"/>
+       </tran_glyph>
+      </tran>
+      <state_glyph node="15,8,13,10"/>
+     </state>
+     <state_glyph node="2,4,28,26"/>
+    </state>
+    <state_diagram size="32,32"/>
+   </statechart>
+  </class>
+  <class name="Control" superclass="qpc::QActive">
+   <documentation>Motor control. Depending on motor type</documentation>
+   <statechart>
+    <initial target="../1">
+     <initial_glyph conn="6,2,5,1,36,6,-2">
+      <action box="0,-2,10,2"/>
+     </initial_glyph>
+    </initial>
+    <state name="state1">
+     <state_glyph node="6,6,34,22"/>
+    </state>
+    <state_diagram size="80,50"/>
+   </statechart>
+  </class>
+  <attribute name="AO_Front" type="QActive* const" visibility="0x00" properties="0x00">
+   <documentation>opaque pointer to Front AO</documentation>
+  </attribute>
+  <attribute name="AO_Control" type="QActive* const" visibility="0x00" properties="0x00">
+   <documentation>opaque pointer to Control AO</documentation>
+  </attribute>
+  <operation name="Front_ctor" type="void" visibility="0x00" properties="0x01">
+   <documentation>&quot;Constructor&quot; for Front active object</documentation>
+   <code>Front *me = &amp;l_front;
+QActive_ctor(&amp;me-&gt;super, Q_STATE_CAST(&amp;Front_initial));
+// Time event constructors
+QTimeEvt_ctorX(&amp;me-&gt;RdyTimeEvt, &amp;me-&gt;super, READY_SIG, 0U);
+QTimeEvt_ctorX(&amp;me-&gt;HoldTimeEvt, &amp;me-&gt;super, HOLD_TIMEOUT_SIG, 0U);
+// Nav.Generator SM
+Front_NavGen_ctor(&amp;me-&gt;navgen);
+QHSM_INIT((QHsm*)&amp;me-&gt;navgen,(QEvt*)0);
+
+QS_FUN_DICTIONARY(&amp;Front_Startup);</code>
+  </operation>
+  <operation name="Control_ctor" type="void" visibility="0x00" properties="0x01">
+   <documentation>&quot;Constructor&quot; for Control active object</documentation>
+   <code>Control *me = &amp;l_control;
+QActive_ctor(&amp;me-&gt;super, Q_STATE_CAST(&amp;Control_initial));</code>
+  </operation>
+ </package>
+ <package name="BSP" stereotype="0x00">
+  <operation name="_AddressError" type="void __attribute__((__interrupt__,__no_auto_psv__))" visibility="0x00" properties="0x00">
+   <documentation>Catches memory alignment error(s)</documentation>
+   <code>while(1);    //Address error</code>
+  </operation>
+  <operation name="_StackError" type="void __attribute__((__interrupt__,__no_auto_psv__))" visibility="0x00" properties="0x00">
+   <documentation>Catches stack error(s)</documentation>
+   <code>while(1);</code>
+  </operation>
+  <operation name="_T1Interrupt" type="void  __attribute__((__interrupt__, auto_psv))" visibility="0x00" properties="0x00">
+   <documentation>QF tick generator. Also reads encoder and encoder button.</documentation>
+   <code>/* ----------------------------- 80 symbols --------------------------------- */
+#define KEYS (portb &amp; EBUT_MASK)
+
+typedef union {    //key specific
+         uint8_t w;
+         struct {
+             unsigned : 2;
+             unsigned ebut: 1;
+             unsigned : 5;
+         } __attribute__ ((__packed__));
+} Ku;
+
+static QEvt const EnciEvt = { ENCI_SIG, 0U, 0U };
+static QEvt const EncdEvt = { ENCD_SIG, 0U, 0U };
+static QEvt const PressEvt = { PRESS_SIG, 0U, 0U };
+static QEvt const ReleaseEvt = { RELEASE_SIG, 0U, 0U };
+
+static const QEvt* const enc_states[] =         //encoder lookup table
+    {0, &amp;EncdEvt, &amp;EnciEvt, 0, &amp;EnciEvt, 0, 0, &amp;EncdEvt, &amp;EncdEvt, 0, 0,
+         &amp;EnciEvt, 0, &amp;EnciEvt, &amp;EncdEvt, 0};
+
+static uint8_t old_AB = 0;    //previous state of the encoder
+
+static uint8_t deb_idx = 0;   //index to button debounce history
+static Ku kbd[4];             //button debounce history
+static Ku keys = {0};         //debounced keys
+Ku les = {0};                 //leading edges
+Ku tes = {0};                 //trailing edges
+Ku oldk;                      //prev.state of debounced keys
+
+_T1IF = 0;                    /* clear interrupt flag */
+
+uint16_t porta = PORTA;       // read encoder and button
+uint16_t portb = PORTB;
+
+//process encoder
+old_AB &lt;&lt;= 2;                            // remember previous state
+old_AB |= ( porta &amp; 0x0003 );            // add current state
+
+if ( enc_states[(old_AB &amp; 0x0f)] ) { // other than zero
+    QACTIVE_POST_X(AO_Front, enc_states[(old_AB &amp; 0x0f)], 1, &amp;l_T1Interrupt);
+}
+
+//process buttons
+deb_idx++;
+deb_idx &amp;= 0x03;                 //wrap
+kbd[deb_idx].w = (uint8_t)KEYS;  //store current state of the keys
+oldk = keys;                     //store previous state of debounced keys
+
+keys.w |= kbd[0].w &amp; kbd[1].w &amp; kbd[2].w &amp; kbd[3].w;  // All on  - set
+keys.w &amp;= kbd[0].w | kbd[1].w | kbd[2].w | kbd[3].w;  // All off - clear
+
+les.w |= (keys.w ^ oldk.w) &amp; keys.w;     // or in new leading edges
+tes.w |= (keys.w ^ oldk.w) &amp; ~keys.w;    // or in new trailing edges
+
+if (les.ebut) {
+    QACTIVE_POST_X(AO_Front, &amp;ReleaseEvt, 1, &amp;l_T1Interrupt);
+}
+
+if (tes.ebut) {
+    QACTIVE_POST_X(AO_Front, &amp;PressEvt, 1, &amp;l_T1Interrupt);
+}
+
+#ifdef Q_SPY
+    {
+        QS_tickTime_ += QS_tickPeriod_; /* account for the clock rollover */
+    }
+#endif
+
+QF_TICK_X(0U, &amp;l_T1Interrupt); /* process time events for rate 0 */</code>
+  </operation>
+  <operation name="_T2Interrupt" type="void  __attribute__((__interrupt__, auto_psv))" visibility="0x00" properties="0x00">
+   <documentation>LCD output bit banging. 32 byes of display data are output with all necessary pauses between bytes. The timer then stops and disables its own interrupt to signal the application that screen buffer can be updated.</documentation>
+   <code>/* ----------------------------- 80 symbols --------------------------------- */
+#define E_DELAY FCY/1000000UL    // 1 us E strobe margins
+#define XFER_DELAY 40*E_DELAY    // 40 us delay between transfers
+
+static uint8_t state = 0;    // Bit bang SM state
+static int8_t i = 0;         // buffer index
+// static uint8_t* buf = display_buffer;
+uint8_t data;
+
+
+
+T2CONbits.TON = 0;        /* stop the timer */
+_T2IF = 0;                    /* clear interrupt flag */
+
+switch( state ) {
+
+    case 0:    // send line
+
+        RS_PIN = 1;  //set data register
+        data = display_buffer [ i++ ];
+        if ( i == 16U ) {
+            
+            state++;
+        }
+        if ( i == 32U ) {
+
+            i = 0;
+            state++;
+        }
+        break;
+
+    case 1:    // switch lines
+
+        RS_PIN = 0;    // set command register
+        if ( i == 0 ) {
+
+            data = 0x80;    // set first line
+            state++;        // this is last byte
+        }
+        else {
+
+            data = 0xc0;    // set second line
+            state--;        // keep output the data
+        }        
+        break;
+    
+    case 2:        // stop
+
+        _T2IE = 0;
+        T2CONbits.TON = 0;
+        state = 0;    // reset the machine
+        return;       // do not send any data        
+}
+
+/* do the transfer */
+LATB &amp;= ~DISP_DATA;                // clean display data lines
+LATB |= (( data &lt;&lt; 8 ) &amp; 0xf000 ); //assert upper nibble
+E_PIN = 1;                         // strobe E
+E_PIN = 0;
+LATB &amp;= ~DISP_DATA;     // clean display data lines
+LATB |= ( data &lt;&lt; 12 ); //assert lower nibble
+E_PIN = 1;              // strobe E
+E_PIN = 0;
+TMR2  = 0x0000U;  // Start counting from 0
+PR2   = XFER_DELAY;
+T2CONbits.TON = 1;</code>
+  </operation>
+  <operation name="_IC2Interrupt" type="void  __attribute__((__interrupt__, auto_psv))" visibility="0x00" properties="0x00">
+   <documentation>A4960 TACHO output handler. Sums up 6 pulses from TACHO, then averages and outputs if value is changed since last output</documentation>
+   <code>/* ----------------------------- 80 symbols --------------------------------- */
+static uint16_t icprev = 0;        // previous value of a capture buffer
+static uint16_t rpmprev = 0;        // previous value of averaged rpm
+static uint32_t comm_cycle = 0;    // commutation cycle time
+static int8_t tacho_count = 0;    // step count in comm.cycle
+uint16_t tmpdata;
+uint16_t rpm;
+
+_IC2IF = 0;                    /* clear interrupt flag */
+
+        do {
+            tacho_count++;
+            tmpdata = IC2BUF;
+            comm_cycle += ( tmpdata - icprev );
+            icprev = tmpdata;
+            
+            if( tacho_count == 6 ) { // last value in a cycle
+
+                rpm = (120000000UL/14)/comm_cycle;    // 14 pole pairs
+
+                comm_cycle = 0;
+                tacho_count = 0;
+                
+                tmpdata = ewma_add( &amp;avg_rpm, rpm );
+
+                if( rpmprev != tmpdata ) { // value changed
+
+                    rpmprev = tmpdata;
+                    TachoEvt* te = Q_NEW( TachoEvt, TACHO_SIG );
+                    te-&gt;val = rpmprev;
+                    QACTIVE_POST_X(AO_Front, (QEvt*)te, 1, 0);
+
+                    //QS_BEGIN( CONSOLE_OUT, 0 )
+                    //    QS_U16( 5, rpmprev );
+                    //QS_END()
+                } // if( rpmprev != tmpdata...
+            } // if( tacho_count == 6...
+
+        } while( IC2CON1bits.ICBNE );</code>
+  </operation>
+  <operation name="_U2RXInterrupt" type="void  __attribute__((__interrupt__, auto_psv))" visibility="0x00" properties="0x00">
+   <code>while( U2STAbits.URXDA == 1 ) {    //receive buffer has data
+#ifdef Q_SPY
+    uint32_t b = U2RXREG;
+    QS_RX_PUT(b);
+#else
+//        MenuSelectEvt* mse = Q_NEW(MenuSelectEvt, MENU_SELECT_SIG);
+//        mse-&gt;key = U2RXREG;
+//        QACTIVE_POST( AO_CLI, (QEvt*)mse, &amp;l_U2RXInterrupt );
+#endif
+}
+
+_U2RXIF = 0;
+//Input can be paced by disabling interrupt here and re-enabling in &amp;Console</code>
+  </operation>
+  <operation name="_U2TXInterrupt" type="void  __attribute__((__interrupt__, auto_psv))" visibility="0x00" properties="0x00">
+   <code>_U2TXIF = 0;
+
+    // while( U2STAbits.UTXBF == 0 ) {    //UART buffer available
+
+        if( *pPrintStr ) {             //previous string not completed
+            U2TXREG = *pPrintStr++;
+        }//if( *pPrintStr...
+        else {                         //get next string
+
+            if( ConsoleTx_Head != ConsoleTx_Tail ) {    //data available
+
+                ConsoleTx_Tail++;
+#if CONSOLE_TX_BUFMASK &lt; 255
+                ConsoleTx_Tail &amp;= CONSOLE_TX_BUFMASK;
+#endif //CONSOLE_TX_BUFMASK &lt; 255
+
+                pPrintStr = ConsoleTx_Buf[ ConsoleTx_Tail ];
+                _U2TXIF = 1;
+
+            }//if( ConsoleTx_Head != ConsoleTx_Tail...
+            else {    //queue empty
+
+                _U2TXIE = 0;    //disable interrupt
+                return;    //IF not cleaned - bug?
+            }
+        }//else - get next string
+    // }//while( U2STAbits.UTXBF == 0...
+
+</code>
+  </operation>
+  <operation name="QF_onStartup" type="void" visibility="0x00" properties="0x00">
+   <code>/* Timer 1 - provides system tick */
+T1CON = 0x0010U;  /* Use Internal Osc (Fcy), 16 bit mode, prescaler = 8 */
+TMR1  = 0x0000U; /* Start counting from 0 and clear the prescaler count */
+PR1   = (uint16_t)(BSP_TMR1_PERIOD - 1U);              /* Timer1 period */
+//_T1IP = TIMER1_ISR_PRIO;           /* set Timer 1 interrupt priority  */
+_T1IF = 0;                           /* clear the interrupt for Timer 1 */
+_T1IE = 1;                              /* enable interrupt for Timer 1 */
+T1CONbits.TON = 1;                                     /* start Timer 1 */
+
+/* Timer 2 - sends out LCD data */
+T2CON = 0x0000U;  /* Use Internal Osc (Fcy), 16 bit mode, prescaler = 1 */
+TMR2  = 0x0000U; /* Start counting from 0 and clear the prescaler count */
+PR2   = 1U;              /* Timer2 period */
+//_T2IP = TIMER2_ISR_PRIO;              /* set Timer 1 interrupt priority */
+_T2IF = 0;                           /* clear the interrupt for Timer 1 */
+/* Timer 2 interrupt enabled by data - not here */
+
+/* initialize UART2 */
+TX_TRIS = 0;
+U2STA  = 0x0000U;                        /* use default settings of 8N1 */
+U2STAbits.UTXISEL1 = 1;    /* interrupt on empty Tx */
+U2MODE = 0x0008U;                              /* enable high baud rate */
+
+#ifdef Q_SPY
+    U2BRG  = ((FCY / 4 / QS_BAUD_RATE) - 1);
+#else
+    U2BRG  = ((FCY / 4 / BAUD_RATE_CONSOLE) - 1);
+#endif
+
+U2MODEbits.UARTEN = 1; //UART then Tx - in that order!
+U2STAbits.UTXEN   = 1;
+
+uint8_t tmpdata = U2RXREG;       //clear RX errors
+U2STAbits.FERR = 0;
+U2STAbits.OERR = 0;
+
+/* UART2 Tx interrupt enabled by data - not here */
+_U2RXIF = 0;
+_U2ERIF = 0;
+
+/* UART2 Rx */
+_U2RXIE = 1;    // enable UART2 Rx Interrupt
+
+_IC2IE = 1;    // enable IC2 interrupt
+
+#ifdef Q_SPY
+
+if (QS_INIT((void *)0) == 0) {    /* initialize the QS software tracing */
+    Q_ERROR();
+}
+QS_RESET();
+QS_OBJ_DICTIONARY(&amp;l_T1Interrupt);
+QS_USR_DICTIONARY(A1_STAT);
+QS_USR_DICTIONARY(COMMAND_STAT);
+QS_USR_DICTIONARY(CONSOLE_OUT);
+
+#endif    // Q_SPY</code>
+  </operation>
+  <operation name="BSP_init" type="void" visibility="0x00" properties="0x00">
+   <documentation>Board initialization</documentation>
+   <code>/* ----------------------------- 80 symbols --------------------------------- */
+// _TRISB15 = 0;
+// REFOCONbits.ROEN = 1;   //output CPU clock for testing
+
+CLKDIVbits.RCDIV = 0b000;    // no postscaler
+RCONbits.SWDTEN = 0; /* disable Watchdog */
+
+/* configure I/O ports */
+ANSA = 0;    // analog out on port A
+ANSB = 0;    // analog out on port B
+
+/* SPI2 init */
+
+SCLK_TRIS = 0;
+MOSI_TRIS = 0;
+ALCS_PIN = 1;    //deassert CS
+ALCS_TRIS = 0;
+PWM_TRIS = 0;
+PWM_PIN = 1;
+
+SPI2CON1bits.MSTEN = 1;    // master mode
+SPI2CON1bits.MODE16 = 1;   // 16-bit xfer
+SPI2CON1bits.CKE = 1;      // clock edge
+SPI2CON1bits.SPRE = 0b111;  // 1:1
+SPI2CON1bits.PPRE = 0b10;  // 4:1
+SPI2STATbits.SPIROV = 0;    // FRM DS39699B-page 23-10
+SPI2STATbits.SPIEN = 1;    // enable module
+
+/* OC1 init */
+
+OC1CON1bits.OCTSEL = 0b111;        // clock FCY
+OC1CON2bits.SYNCSEL = 0b11111;    // sync to self
+OC1R = 30;
+OC1RS = 500;
+OC1CON1bits.OCM = 0b110;       // enable in edge PWM mode
+
+/* IC2 init */
+IC2CON2bits.SYNCSEL = 0;    // do not sync
+IC2CON1bits.IC2TSEL = 0b100;    // Timer 1
+IC2CON1bits.ICM = 0b011;    // capture on every rising edge
+IC2CON1bits.ICI = 0b11;     // generate interrupt every 4th capture
+
+/* Encoder */
+EBUT_PULLUP = 1;
+ENCA_PULLUP = 1;
+ENCB_PULLUP = 1;
+
+/* Display */
+
+E_TRIS = 0;
+
+BL_TRIS = 0;    // backlight
+BL_PIN = 0;
+
+RS_TRIS = 0;
+
+D4_TRIS = 0;
+D5_TRIS = 0;
+D6_TRIS = 0;
+D7_TRIS = 0;
+
+/* Display Init */
+static const uint8_t const init_nibble[] = {
+      0x03, 0x03, 0x03, 0x02,    // switch to 4-bit
+      0x02, 0x08,    // Func.set 4 bit, 2 lines
+      0x00, 0x08,    // Display Off
+      0x00, 0x01,    // Clear Display
+      0x00, 0x06,    // Entry Mode Set
+      0x00, 0x0c,    // Display On
+};
+     
+RS_PIN = 0;    // 
+
+__delay_ms(100);
+int8_t i;
+
+for ( i = 0; i &lt; Q_DIM(init_nibble); i++ ) {
+        
+    LATB &amp;= ~DISP_DATA;    // clean display data lines
+    LATB |= ( init_nibble[ i ] &lt;&lt; 12 );
+    __delay_us(1);
+    E_PIN = 1;        // strobe E
+    __delay_us(1);
+    E_PIN = 0;
+    __delay_ms(3);
+}
+
+/* Initialize timers */</code>
+  </operation>
+  <operation name="QF_onCleanup" type="void" visibility="0x00" properties="0x00">
+   <code>/* empty */</code>
+  </operation>
+  <operation name="QV_onIdle" type="void" visibility="0x00" properties="0x00">
+   <code>/* UART code is PIC24FxxxKA3xx-specific */
+#ifdef Q_SPY
+    QF_INT_ENABLE();
+    QS_rxParse();  /* parse all the received bytes */
+
+    if (U2STAbits.TRMT == 1) {  /* TX done? */
+        uint16_t fifo = QS_TXFIFO_DEPTH;   /* max bytes we can accept */
+        uint8_t const *block;
+
+        QF_INT_DISABLE();
+        block = QS_getBlock(&amp;fifo);  /* try to get next block to transmit */
+        QF_INT_ENABLE();
+
+        while (fifo-- != 0) {        /* any bytes in the block? */
+            U2TXREG = *block++;    /* put into the FIFO */
+        }
+    }//if (U2STAbits.TRMT...
+#elif defined NDEBUG
+    /* Put the CPU and peripherals to the low-power mode.
+    * you might need to customize the clock management for your application
+    */
+    QV_CPU_SLEEP();  /* atomically go to sleep and enable interrupts */
+#else
+    QF_INT_ENABLE(); /* just enable interrupts */
+#endif
+
+#if 0
+       __asm__ volatile(&quot;disi #0x0001&quot;);
+        Idle();                          /* transition to Idle mode, see NOTE02 */
+    #else
+
+#endif    // 0</code>
+  </operation>
+  <operation name="Q_onAssert" type="void" visibility="0x00" properties="0x00">
+   <parameter name="module" type="char const*"/>
+   <parameter name="loc" type="int"/>
+   <code>(void)module;
+(void)loc;
+QS_ASSERTION(module, loc, (uint32_t)10000U); /* report assertion to QS */
+for (;;) {}</code>
+  </operation>
+  <operation name="QS_onStartup" type="uint8_t" visibility="0x00" properties="0x00">
+   <parameter name="arg" type="void const*"/>
+   <code>static uint8_t qsTxBuf[QS_BUF_SIZE]; /* buffer for QS transmit channel */
+static uint8_t qsRxBuf[100];    /* buffer for QS receive channel */
+uint8_t tmpdata;
+
+    QS_initBuf  (qsTxBuf, sizeof(qsTxBuf));
+    QS_rxInitBuf(qsRxBuf, sizeof(qsRxBuf));
+    QS_tickPeriod_ = BSP_TMR1_PERIOD;
+    QS_tickTime_ = QS_tickPeriod_; /* to start the timestamp at zero */
+                                   /* setup the QS filters... */
+    QS_FILTER_OFF(QS_ALL_RECORDS);
+
+    // Let us know when we add dictionary entries
+    QS_FILTER_ON(QS_SIG_DICT);
+    QS_FILTER_ON(QS_OBJ_DICT);
+    QS_FILTER_ON(QS_FUN_DICT);
+    QS_FILTER_ON(QS_USR_DICT);
+
+    // QS_FILTER_ON(QS_QF_TICK);
+    QS_FILTER_ON(CONSOLE_OUT);
+    QS_FILTER_ON(QS_QF_ACTIVE_POST_FIFO);
+    QS_FILTER_ON(QS_QEP_STATE_ENTRY);
+    QS_FILTER_ON(QS_QEP_STATE_EXIT);
+
+#if 0
+
+//    QS_FILTER_OFF(QS_QEP_STATE_EMPTY);
+//    QS_FILTER_OFF(QS_QEP_STATE_ENTRY);
+//    QS_FILTER_OFF(QS_QEP_STATE_EXIT);
+//    QS_FILTER_OFF(QS_QEP_STATE_INIT);
+//    QS_FILTER_OFF(QS_QEP_INIT_TRAN);
+//    QS_FILTER_OFF(QS_QEP_INTERN_TRAN);
+//    QS_FILTER_OFF(QS_QEP_TRAN);
+//    QS_FILTER_OFF(QS_QEP_dummyD);
+
+    QS_FILTER_OFF(QS_QF_ACTIVE_ADD);
+    QS_FILTER_OFF(QS_QF_ACTIVE_REMOVE);
+    QS_FILTER_OFF(QS_QF_ACTIVE_SUBSCRIBE);
+    QS_FILTER_OFF(QS_QF_ACTIVE_UNSUBSCRIBE);
+    QS_FILTER_OFF(QS_QF_ACTIVE_POST_FIFO);
+    QS_FILTER_OFF(QS_QF_ACTIVE_POST_LIFO);
+    QS_FILTER_OFF(QS_QF_ACTIVE_GET);
+    QS_FILTER_OFF(QS_QF_ACTIVE_GET_LAST);
+    QS_FILTER_OFF(QS_QF_EQUEUE_INIT);
+    QS_FILTER_OFF(QS_QF_EQUEUE_POST_FIFO);
+    QS_FILTER_OFF(QS_QF_EQUEUE_POST_LIFO);
+    QS_FILTER_OFF(QS_QF_EQUEUE_GET);
+    QS_FILTER_OFF(QS_QF_EQUEUE_GET_LAST);
+    QS_FILTER_OFF(QS_QF_MPOOL_INIT);
+    QS_FILTER_OFF(QS_QF_MPOOL_GET);
+    QS_FILTER_OFF(QS_QF_MPOOL_PUT);
+    QS_FILTER_OFF(QS_QF_PUBLISH);
+    QS_FILTER_OFF(QS_QF_NEW);
+    QS_FILTER_OFF(QS_QF_GC_ATTEMPT);
+    QS_FILTER_OFF(QS_QF_GC);
+//    QS_FILTER_OFF(QS_QF_TICK);
+    QS_FILTER_OFF(QS_QF_TIMEEVT_ARM);
+    QS_FILTER_OFF(QS_QF_TIMEEVT_AUTO_DISARM);
+    QS_FILTER_OFF(QS_QF_TIMEEVT_DISARM_ATTEMPT);
+    QS_FILTER_OFF(QS_QF_TIMEEVT_DISARM);
+    QS_FILTER_OFF(QS_QF_TIMEEVT_REARM);
+    QS_FILTER_OFF(QS_QF_TIMEEVT_POST);
+    QS_FILTER_OFF(QS_QF_CRIT_ENTRY);
+    QS_FILTER_OFF(QS_QF_CRIT_EXIT);
+    QS_FILTER_OFF(QS_QF_ISR_ENTRY);
+    QS_FILTER_OFF(QS_QF_ISR_EXIT);
+
+#endif    // 0
+
+    QS_SIG_DICTIONARY(READY_SIG, 0);
+    QS_SIG_DICTIONARY(ENCI_SIG, 0);
+    QS_SIG_DICTIONARY(ENCD_SIG, 0);
+    QS_SIG_DICTIONARY(LEFT_SIG, 0);
+    QS_SIG_DICTIONARY(RIGHT_SIG, 0);
+    QS_SIG_DICTIONARY(PRESS_SIG, 0);
+    QS_SIG_DICTIONARY(RELEASE_SIG, 0);
+    QS_SIG_DICTIONARY(CLICK_SIG, 0);
+    QS_SIG_DICTIONARY(HOLD_SIG, 0);
+    QS_SIG_DICTIONARY(KEY_SIG, 0);
+    QS_SIG_DICTIONARY(BLINK_SIG, 0);
+    QS_SIG_DICTIONARY(WARNING_SIG, 0);
+    QS_SIG_DICTIONARY(FAULT_SIG, 0);
+    QS_SIG_DICTIONARY(HEARTBEAT_SIG, 0);
+    QS_SIG_DICTIONARY(NAV_TIMEOUT_SIG, 0);
+    QS_SIG_DICTIONARY(HOLD_TIMEOUT_SIG, 0);
+
+    /* set object dictionaries for AOs */
+    QS_OBJ_DICTIONARY(AO_Front);
+//    QS_OBJ_DICTIONARY(AO_Control);
+
+    QS_FUN_DICTIONARY(&amp;NavGen_initial);
+    QS_FUN_DICTIONARY(&amp;NavGen_HandleEncoder);
+    QS_FUN_DICTIONARY(&amp;NavGen_Released);
+    QS_FUN_DICTIONARY(&amp;NavGen_Pressed);
+
+    return (uint8_t)1;            /* indicate successfull QS initialization */</code>
+  </operation>
+  <operation name="QS_onCleanup" type="void" visibility="0x00" properties="0x00">
+   <code>/* empty */</code>
+  </operation>
+  <operation name="QS_onGetTime" type="QSTimeCtr" visibility="0x00" properties="0x00">
+   <code>if (_T1IF == 0) {
+
+    return QS_tickTime_ + (uint32_t)TMR1;
+
+} else {
+
+    return QS_tickTime_ + QS_tickPeriod_ + (uint32_t)TMR1;
+}</code>
+  </operation>
+  <operation name="QS_onFlush" type="void" visibility="0x00" properties="0x00">
+   <code>uint16_t fifo = QS_TXFIFO_DEPTH; /* Tx FIFO depth */
+uint8_t const *block;
+
+    QF_INT_DISABLE();
+    while ((block = QS_getBlock(&amp;fifo)) != (uint8_t *)0) {
+        QF_INT_ENABLE();
+        /* busy-wait as long as TX FIFO has data to transmit */
+        while (U2STAbits.TRMT == 0) {
+        }
+
+        while (fifo-- != 0) {    /* any bytes in the block? */
+            U2TXREG = *block++; /* put into the TX FIFO */
+        }
+        fifo = QS_TXFIFO_DEPTH; /* re-load the Tx FIFO depth */
+        QF_INT_DISABLE();
+    }
+    QF_INT_ENABLE();</code>
+  </operation>
+  <operation name="QS_onReset" type="void" visibility="0x00" properties="0x00">
+   <code>__asm__ volatile (&quot;reset&quot;);</code>
+  </operation>
+  <operation name="QS_onCommand" type="void" visibility="0x00" properties="0x00">
+   <parameter name="cmdId" type="uint8_t"/>
+   <parameter name="param" type="uint32_t"/>
+   <code>void assert_failed(char const *module, int loc);
+(void)cmdId;
+(void)param;
+QS_BEGIN(COMMAND_STAT, (void *)0) /* application-specific record begin */
+    QS_U8(2, cmdId);
+    QS_U32(8, param);
+QS_END()
+
+if (cmdId == 10U) {
+    Q_ERROR();
+}
+else if (cmdId == 11U) {
+    Q_onAssert(&quot;QS_onCommand&quot;, 123);
+}</code>
+  </operation>
+ </package>
+ <directory name="../include">
+  <file name="stirrer.h">
+   <text>#ifndef stirrer_h
+#define stirrer_h
+
+#include &quot;qpc.h&quot;
+#include &quot;bsp.h&quot;
+
+
+
+#ifdef Q_SPY
+#include &quot;qs_port.h&quot;
+#endif
+
+/* Signals */
+enum StirrerSignals {
+    READY_SIG = Q_USER_SIG,    // system ready 
+    MAX_PUB_SIG,
+    /**/
+    TACHO_SIG,
+    /**/
+    ENCI_SIG,    // encoder signals
+    ENCD_SIG,
+    LEFT_SIG,    
+    RIGHT_SIG,
+    PRESS_SIG,
+    RELEASE_SIG,
+    CLICK_SIG,
+    HOLD_SIG,
+    /**/
+    KEY_SIG,      // console key
+    BLINK_SIG,    // display blink timer
+    WARNING_SIG,  // backlight warning
+    FAULT_SIG,    // motor fault
+    HEARTBEAT_SIG,    // heartbeat LED
+    /**/
+    NAV_TIMEOUT_SIG,
+    HOLD_TIMEOUT_SIG,
+    /**/
+    MAX_SIG       /* the last signal */
+};
+
+#ifdef Q_SPY
+
+enum AppRecords {                 /* application-specific trace records */
+     A1_STAT = QS_USER,
+     COMMAND_STAT,
+     CONSOLE_OUT
+};
+
+#endif    // Q_SPY
+
+/* declare all events at once */
+$declare(Events)
+
+/* declare AO &quot;constructors&quot; */
+$declare(AOs::Front_ctor)
+$declare(AOs::Control_ctor)
+
+/* declare AOs */
+$declare(AOs::NavGen)
+$declare(AOs::AO_Front)
+$declare(AOs::AO_Control)
+
+
+#endif /* stirrer_h */</text>
+  </file>
+  <file name="bsp.h">
+   <text>#ifndef bsp_h
+#define bsp_h
+
+#define BSP_TICKS_PER_SEC    100U
+
+/* frequency of the oscillator */
+#define FOSC_HZ    32000000UL
+/* instruction cycle clock frequency */
+#define FCY_HZ     (FOSC_HZ / 2U)
+#define FCY        FCY_HZ
+#include &lt;libpic30.h&gt;
+
+/* system clock tick period in CPU clocks / TMR1 prescaler */
+#define BSP_TMR1_PERIOD         ((uint16_t)(FCY_HZ/(BSP_TICKS_PER_SEC*8)))
+
+/* Pins */
+
+/* motor controller interface */
+
+// SPI2 
+
+// SCLK line
+#define SCLK_MASK     _PORTB_RB5_MASK
+#define SCLK_TRIS     _TRISB5   
+#define SCLK_PIN      _LATB5
+
+// MOSI line
+#define MOSI_MASK     _PORTB_RB6_MASK
+#define MOSI_TRIS     _TRISB6   
+#define MOSI_PIN      _LATB6
+
+// AL_CS line
+#define ALCS_MASK     _PORTB_RB4_MASK
+#define ALCS_TRIS     _TRISB4   
+#define ALCS_PIN      _LATB4
+
+// other pins
+
+// PWM line
+#define PWM_MASK     _PORTB_RB7_MASK
+#define PWM_TRIS     _TRISB7   
+#define PWM_PIN      _LATB7
+
+/* Encoder */
+//it pays to keep encoder channels together
+#define ENCA_MASK     _PORTA_RA0_MASK //Encoder A channel
+#define ENCA_TRIS     _TRISA0   
+#define ENCA_PIN      _RA0
+#define ENCA_PULLUP   _CN2PUE
+#define ENCA_PULLDN   _CN2PDE
+
+#define ENCB_MASK     _PORTA_RA1_MASK //Encoder B channel
+#define ENCB_TRIS     _TRISA1    
+#define ENCB_PIN      _RA1
+#define ENCB_PULLUP   _CN3PUE
+#define ENCB_PULLDN   _CN3PDE
+
+#define EBUT_MASK     _PORTB_RB2_MASK //Button on encoder shaft
+#define EBUT_TRIS     _TRISB2    
+#define EBUT_PIN      _RB2
+#define EBUT_PULLUP   _CN6PUE
+
+/* Display */
+// E line
+#define E_MASK     _PORTA_RA2_MASK
+#define E_TRIS     _TRISA2   
+#define E_PIN      _LATA2 // _RA2
+// Backlight
+#define BL_MASK     _PORTA_RA3_MASK
+#define BL_TRIS     _TRISA3
+#define BL_PIN      _LATA3
+
+#define DISP_OUT_A (E_MASK | BL_MASK)
+
+//RS Line
+#define RS_MASK     _PORTB_RB8_MASK
+#define RS_TRIS     _TRISB8
+#define RS_PIN      _LATB8
+//Data
+//B12-B15
+#define D4_MASK     _PORTB_RB12_MASK
+#define D4_TRIS     _TRISB12
+#define D4_PIN      _LATB12
+
+#define D5_MASK     _PORTB_RB13_MASK
+#define D5_TRIS     _TRISB13
+#define D5_PIN      _LATB13
+
+#define D6_MASK     _PORTB_RB14_MASK
+#define D6_TRIS     _TRISB14
+#define D6_PIN      _LATB14
+
+#define D7_MASK     _PORTB_RB15_MASK
+#define D7_TRIS     _TRISB15
+#define D7_PIN      _LATB15
+
+#define DISP_OUT_B (RS_MASK|D4_MASK|D5_MASK|D6_MASK|D7_MASK)
+
+#define DISP_DATA (D4_MASK|D5_MASK|D6_MASK|D7_MASK)
+
+/* Console */
+//TX line
+#define TX_MASK     _PORTB_RB0_MASK
+#define TX_TRIS     _TRISB0   
+#define TX_PIN      _RB0
+
+
+
+void BSP_init(void);
+
+#endif /* bsp_h */</text>
+  </file>
+ </directory>
+ <directory name="../src">
+  <file name="front.c">
+   <text>/* ----------------------------- 80 symbols --------------------------------- */
+// #include &quot;qpc.h&quot;
+#include &quot;stirrer.h&quot;
+// #include &quot;bsp.h&quot;
+
+#include &lt;string.h&gt;
+
+Q_DEFINE_THIS_FILE
+
+$declare(AOs::Front)
+/* Numeric output TODO: replace with a pointer queue */
+void itoa(uint16_t n, uint8_t s[]);
+void reverse(uint8_t s[]);
+
+/* Moving average weight. Must be power of 2 */
+#define RPM_WEIGHT 4
+
+static struct ewma {    // averaged tachometer
+    uint16_t internal;
+    uint8_t weight;
+} avg_rpm;
+
+/* EWMA related */
+void ewma_init(struct ewma *avg, uint8_t weight);
+
+uint16_t ewma_add(struct ewma* avg, uint16_t val);
+
+/* PID related */
+// x - control signal (PWM)
+
+#define N 1U    // prop.shift range 1 - 16
+#define NMIN -(1&lt;&lt;(15+N))
+#define NMAX (1&lt;&lt;(15+N))-1
+
+
+int16_t pid_update(uint16_t tacho);
+
+// AO Timers
+#define READY_TIME 10U
+#define HOLD_TIME BSP_TICKS_PER_SEC*2
+
+//Console TX buffer - must be power of 2
+#ifndef Q_SPY
+
+#define CONSOLE_TX_BUFSIZE 16
+
+#else    // qspy uses this uart
+
+#define CONSOLE_TX_BUFSIZE 1
+
+#endif
+
+#define CONSOLE_TX_BUFMASK ( CONSOLE_TX_BUFSIZE - 1 )
+
+#if ( CONSOLE_TX_BUFSIZE &amp; CONSOLE_TX_BUFMASK )
+#error Serial Tx Buffer size is not a power of 2
+#endif
+
+/* A4960 constants */
+#define A4960_CONF0_RD 0
+#define A4960_CONF0_WR 1
+#define A4960_CONF1_RD 2
+#define A4960_CONF1_WR 3
+#define A4960_CONF2_RD 4
+#define A4960_CONF2_WR 5
+#define A4960_CONF3_RD 6
+#define A4960_CONF3_WR 7
+#define A4960_CONF4_RD 8
+#define A4960_CONF4_WR 9
+#define A4960_CONF5_RD 0x0a
+#define A4960_CONF5_WR 0x0b
+#define A4960_MASK_RD 0x0c
+#define A4960_MASK_WR 0x0d
+#define A4960_RUN_RD 0x0e
+#define A4960_RUN_WR 0x0f
+
+
+
+
+
+/* Local objects -----------------------------------------------------------*/
+static Front l_front;     /* the single instance of the Front AO */
+
+
+
+// Serial console
+static const char* ConsoleTx_Buf[ CONSOLE_TX_BUFSIZE ];
+static uint8_t ConsoleTx_Head;
+static volatile uint8_t ConsoleTx_Tail;    //interrupt changes this
+static const char* pPrintStr;   //stores a string being output
+
+// Display
+
+static uint8_t display_buffer[32] = {&quot;Quick Brown Fox Jumps Over&quot;};
+
+/* Directory Screens */
+
+/* Parameter Screens */
+
+/* Parameters */
+
+// Set RPM
+static int16_t SetRpm = 100;
+
+// Number of pole pairs in a brushless motor attached
+// Affects RPM
+static uint8_t PolePairs = 14;
+
+// Encoder Sensitivity
+static int8_t EncoderSensIdx = 4;
+static char* EncoderSensList[] =
+    {&quot;Very High&quot; ,&quot;High&quot; ,&quot;Medium&quot; ,&quot;Low&quot; ,&quot;Very Low&quot; };
+
+/* Constituent SMs */
+$define(AOs::NavGen)
+
+
+/* Global-scope objects ----------------------------------------------------*/
+QActive* const AO_Front = &amp;l_front.super; /* &quot;opaque&quot; AO pointer */
+
+$define(AOs::Front_ctor)
+$define(AOs::Front)
+$define(BSP::_U2TXInterrupt)
+$define(BSP::_T2Interrupt)
+$define(BSP::_IC2Interrupt)
+
+/* modified to handle small positive numbers */
+/* K2R2 itoa:  convert n to characters in s  */
+void itoa(uint16_t n, uint8_t s[]) {
+    uint8_t i = 0;
+ 
+     do {       /* generate digits in reverse order */
+         s[i++] = n % 10 + '0';   /* get next digit */
+     } while ((n /= 10) &gt; 0);     /* delete it */
+
+     s[i] = '\0';
+
+     reverse(s);
+}
+
+/* K2R2 reverse:  reverse string s in place */
+void reverse(uint8_t s[]) {
+uint8_t i, j, c;
+ 
+    for (i = 0, j = strlen((const char*)(s))-1; i&lt;j; i++, j--) {
+         c = s[i];
+         s[i] = s[j];
+         s[j] = c;
+     }
+}
+
+/* EWMA-related functions */
+
+void ewma_init( struct ewma *avg, uint8_t weight ) {
+
+    avg-&gt;weight = QF_LOG2(weight);
+    avg-&gt;internal = 0;
+}
+
+uint16_t ewma_add( struct ewma *avg, uint16_t val ) {
+    avg-&gt;internal = avg-&gt;internal  ?
+        (((avg-&gt;internal &lt;&lt; avg-&gt;weight) - avg-&gt;internal) +
+            val) &gt;&gt; avg-&gt;weight :
+        (val);
+    return avg-&gt;internal;
+}
+
+#if 0
+
+/* PID-related */
+// Takes current IC2 result, calculates new value for pwm
+// inspired by: https://www.embeddedrelated.com/showarticle/123.php
+int16_t pid_update(uint16_t tacho) {
+
+ const int16 N = 1U;    // prop gain shift
+ const int32 nmin = -(1 &lt;&lt; (15+N));
+ const int32 nmax = (1 &lt;&lt; (15+N)) - 1;
+ int16_t x_min16, x_max16;
+
+ int16_t x, sat;
+ int32_t x_integral, p_term;
+ int16_t Kp, Ki2;
+ 
+ int16_t error = SetRpm - tacho;    // calculate error
+
+ 
+#endif    // 0 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+</text>
+  </file>
+  <file name="control.c">
+   <text>#include &quot;qpc.h&quot;
+#include &quot;stirrer.h&quot;
+#include &quot;bsp.h&quot;
+
+Q_DEFINE_THIS_FILE
+
+static int foo;
+
+#if 0
+
+$declare(AOs::Control)
+
+/* Local objects -----------------------------------------------------------*/
+static Control l_control;     /* the single instance of the Front AO */
+
+/* Global-scope objects ----------------------------------------------------*/
+QActive* const AO_Control = &amp;l_control.super; /* &quot;opaque&quot; AO pointer */
+
+$define(AOs::Control_ctor)
+$define(AOs::Control)
+
+#endif    // 0
+
+/* define other elements... */</text>
+  </file>
+  <file name="stirrer.c">
+   <text>// #include &quot;qpc.h&quot;
+#include &quot;stirrer.h&quot;
+// #include &quot;bsp.h&quot;
+
+Q_DEFINE_THIS_FILE
+
+/*..........................................................................*/
+int main() {
+ static QEvt const* frontQueueSto[5];
+// static QEvt const* controlQueueSto[5];
+ 
+ static QF_MPOOL_EL(QEvt)           smlPoolSto[10];
+ static QF_MPOOL_EL(TachoEvt)       medPoolSto[10];
+
+    /* explicitly invoke the active objects' ctors... */
+    Front_ctor();
+//    Control_ctor();
+
+    QF_init();    /* initialize the framework and the underlying RT kernel */
+    BSP_init();   /* initialize the Board Support Package */
+
+    /* send object dictionaries for event queues... */
+    QS_OBJ_DICTIONARY(frontQueueSto);
+//    QS_OBJ_DICTIONARY(controlQueueSto);
+
+    /* send object dictionaries for event pools... */
+    QS_OBJ_DICTIONARY(smlPoolSto);
+//    QS_OBJ_DICTIONARY(medPoolSto);
+
+
+
+
+    /* initialize the event pools... */
+    QF_poolInit(smlPoolSto, sizeof(smlPoolSto), sizeof(smlPoolSto[0]));
+    QF_poolInit(medPoolSto, sizeof(medPoolSto), sizeof(medPoolSto[0]));
+
+    /* send object dictionaries for event queues... */
+//    QS_OBJ_DICTIONARY(frontQueueSto);
+//    QS_OBJ_DICTIONARY(controlQueueSto);
+
+    /* send object dictionaries for event pools... */
+//    QS_OBJ_DICTIONARY(smlPoolSto);
+//    QS_OBJ_DICTIONARY(medPoolSto);
+
+
+
+    /* start the active objects... */
+    QACTIVE_START(AO_Front,
+                  2U,                /* QP priority */
+                  frontQueueSto,  Q_DIM(frontQueueSto), /* evt queue */
+                  (void *)0, 0U,     /* no per-thread stack */
+                  (QEvt *)0);        /* no initialization event */
+
+#if 0
+    QACTIVE_START(AO_Control,
+                  3U,                /* QP priority */
+                  controlQueueSto,    Q_DIM(controlQueueSto), /* evt queue */
+                  (void *)0, 0U,     /* no per-thread stack */
+                  (QEvt *)0);        /* no initialization event */
+
+#endif    // 0
+
+    return QF_run(); /* run the QF application */
+}</text>
+  </file>
+  <file name="bsp.c">
+   <text>/* ----------------------------- 80 symbols --------------------------------- */
+/* Board support package */
+/* Stirrer */
+/* UART2 used for console and qspy */
+// #include &quot;qpc.h&quot;
+#include &quot;stirrer.h&quot;
+// #include &quot;bsp.h&quot;
+
+/* PIC24FV32KA302 configuration bits */
+/* 16 MHz FRC clock with PLL */
+#pragma config BWRP=OFF, BSS=OFF, GWRP=OFF, GSS0=OFF
+#pragma config FNOSC=FRCPLL, SOSCSRC=DIG, LPRCSEL=LP, IESO=OFF
+#pragma config POSCMOD=NONE, OSCIOFNC=OFF, POSCFREQ=LS, SOSCSEL=SOSCLP
+#pragma config FCKSM=CSDCMD, FWDTEN=OFF, WINDIS=OFF, LVRCFG = OFF // RETCFG = OFF
+#pragma config BORV=V20, MCLRE=ON, ICS=PGx2, DSBOREN=OFF, DSWDTEN=OFF
+
+#define BAUD_RATE_CONSOLE 115200UL
+
+Q_DEFINE_THIS_FILE
+
+#ifdef Q_SPY
+
+    #define QS_BAUD_RATE      115200U
+    #define QS_TXFIFO_DEPTH   1U    //rev.A4 tx fifo bug
+    #define QS_BUF_SIZE 1024U
+    #define QS_RX_SIZE  100U
+
+    QSTimeCtr QS_tickTime_;
+    QSTimeCtr QS_tickPeriod_;
+
+    static uint8_t const l_T1Interrupt = 0;
+
+#endif
+
+$define(BSP::_AddressError)
+$define(BSP::_StackError)
+$define(BSP::_T1Interrupt)
+$define(BSP::_U2RXInterrupt)
+/**/
+$define(BSP::BSP_init)
+$define(BSP::QF_onStartup)
+$define(BSP::QF_onCleanup)
+$define(BSP::Q_onAssert)
+$define(BSP::QV_onIdle)
+#ifdef Q_SPY
+/* QS functions */
+$define(BSP::QS_onStartup)
+$define(BSP::QS_onCleanup)
+$define(BSP::QS_onGetTime)
+$define(BSP::QS_onFlush)
+$define(BSP::QS_onReset)
+$define(BSP::QS_onCommand)
+#endif       
+
+</text>
+  </file>
+ </directory>
+</model>
